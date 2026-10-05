@@ -22,6 +22,7 @@ function init(dbPath) {
       size_bytes    INTEGER NOT NULL,
       duration_ms   INTEGER NOT NULL CHECK (duration_ms > 0),
       translation_lang TEXT,
+      speakers_revision INTEGER NOT NULL DEFAULT 0,
       created_at    INTEGER NOT NULL
     );
 
@@ -33,11 +34,25 @@ function init(dbPath) {
       text       TEXT    NOT NULL DEFAULT '',
       reviewed   INTEGER NOT NULL DEFAULT 0 CHECK (reviewed IN (0, 1)),
       revision   INTEGER NOT NULL DEFAULT 1,
+      speaker_id INTEGER REFERENCES speakers(id) ON DELETE RESTRICT,
       updated_at INTEGER NOT NULL,
       UNIQUE (video_id, id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_segments_video ON segments(video_id, start_ms);
+
+    -- 说话人名单：按视频维护；名称去首尾空白后非空且同视频内唯一（见路由层校验）。
+    -- videos.speakers_revision 为名单整体的乐观锁修订号：名单任一次增删改都 +1。
+    -- 删除被片段引用的说话人在路由层拒绝（speaker_id 外键亦带 ON DELETE RESTRICT）。
+    CREATE TABLE IF NOT EXISTS speakers (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      video_id   INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+      name       TEXT    NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_speakers_video ON speakers(video_id, id);
 
     CREATE TABLE IF NOT EXISTS publications (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +63,7 @@ function init(dbPath) {
       translation_lang     TEXT,
       qc_rules_snapshot    TEXT,
       qc_report_snapshot   TEXT,
+      speakers_snapshot    TEXT,
       segment_count INTEGER NOT NULL,
       published_at INTEGER NOT NULL,
       UNIQUE (video_id, version)
@@ -131,6 +147,25 @@ function init(dbPath) {
   }
   if (!pubCols.includes('qc_report_snapshot')) {
     db.exec('ALTER TABLE publications ADD COLUMN qc_report_snapshot TEXT');
+  }
+  if (!pubCols.includes('speakers_snapshot')) {
+    db.exec('ALTER TABLE publications ADD COLUMN speakers_snapshot TEXT');
+  }
+  // 旧库迁移：说话人名单表与片段归属列、视频级名单修订号（新库已由上方 CREATE 携带则跳过）
+  db.exec(`CREATE TABLE IF NOT EXISTS speakers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id   INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    name       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_speakers_video ON speakers(video_id, id)');
+  const segCols = db.prepare('PRAGMA table_info(segments)').all().map((c) => c.name);
+  if (!segCols.includes('speaker_id')) {
+    db.exec('ALTER TABLE segments ADD COLUMN speaker_id INTEGER REFERENCES speakers(id) ON DELETE RESTRICT');
+  }
+  if (!videoCols.includes('speakers_revision')) {
+    db.exec('ALTER TABLE videos ADD COLUMN speakers_revision INTEGER NOT NULL DEFAULT 0');
   }
 
   return db;

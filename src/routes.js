@@ -47,8 +47,61 @@ function mapSegment(row) {
     text: row.text,
     reviewed: row.reviewed === 1,
     revision: row.revision,
+    speaker_id: row.speaker_id == null ? null : row.speaker_id,
     updated_at: row.updated_at,
   };
+}
+
+/* ---------------- 说话人名单与归属 ---------------- */
+
+function mapSpeaker(row) {
+  return { id: row.id, video_id: row.video_id, name: row.name, created_at: row.created_at, updated_at: row.updated_at };
+}
+
+function listSpeakerRows(videoId) {
+  return get()
+    .prepare('SELECT * FROM speakers WHERE video_id = ? ORDER BY id')
+    .all(videoId);
+}
+
+function listSpeakers(videoId) {
+  return listSpeakerRows(videoId).map(mapSpeaker);
+}
+
+// 名称：去首尾空白后非空、不重复（以去空白后的形态比较）；长度上限 80 字符
+function normalizeSpeakerName(value) {
+  if (typeof value !== 'string') {
+    throw new ApiError(422, 'invalid_speaker_name', '说话人名称必须为字符串');
+  }
+  const name = value.trim();
+  if (!name) throw new ApiError(422, 'invalid_speaker_name', '说话人名称去首尾空白后不能为空');
+  if (name.length > 80) throw new ApiError(422, 'invalid_speaker_name', '说话人名称不能超过 80 个字符');
+  return name;
+}
+
+// 名单写操作（增删改）携带所见名单修订号 revision；首次操作前名单修订号为 0
+function parseRosterRevision(body) {
+  const rev = Number(body && body.revision);
+  if (!Number.isInteger(rev) || rev < 0) {
+    throw new ApiError(422, 'missing_revision', '请携带所见名单修订号 revision（首次操作前传 0）');
+  }
+  return rev;
+}
+
+// 名单修订号过期：409 并返回当前名单与逐段归属
+function rosterConflict(videoId, message) {
+  const rev = get().prepare('SELECT speakers_revision r FROM videos WHERE id = ?').get(videoId).r;
+  return new ApiError(409, 'revision_conflict', message, {
+    speakers_revision: rev,
+    speakers: listSpeakers(videoId),
+    assignments: listSegments(videoId).map((s) => ({ segment_id: s.id, speaker_id: s.speaker_id })),
+  });
+}
+
+function loadVideoRow(videoId) {
+  const video = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+  if (!video) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+  return video;
 }
 
 function loadVideo(videoId) {
@@ -91,6 +144,7 @@ function mapPublication(row) {
     has_translation: row.translation_snapshot != null,
     translation_lang: row.translation_lang != null ? row.translation_lang : null,
     has_qc: row.qc_rules_snapshot != null,
+    has_speakers: row.speakers_snapshot != null,
     published_at: row.published_at,
   };
 }
@@ -623,6 +677,8 @@ router.get('/videos/:id(\\d+)', (req, res, next) => {
       segments: listSegments(video.id),
       translation_lang: video.translation_lang != null ? video.translation_lang : null,
       translations: video.translation_lang ? listTranslations(video.id) : [],
+      speakers_revision: video.speakers_revision,
+      speakers: listSpeakers(video.id),
       qc_rules: mapQcRules(loadQcRulesRow(video.id)),
       qc: {
         configured: qcReport.configured,
@@ -864,8 +920,164 @@ router.delete('/videos/:id(\\d+)/segments/:sid(\\d+)', (req, res, next) => {
   }
 });
 
-/* ---------------- 片段拆分（长字幕一分为二，原子完成） ---------------- */
+// 名单与归属的完整当前状态（用于 GET 与各写操作回包）
+function speakerState(video) {
+  return {
+    speakers_revision: video.speakers_revision,
+    speakers: listSpeakers(video.id),
+    assignments: listSegments(video.id).map((s) => ({ segment_id: s.id, speaker_id: s.speaker_id })),
+  };
+}
 
+// GET 说话人名单（含名单修订号）与逐段归属
+router.get('/videos/:id(\\d+)/speakers', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    res.json(speakerState(video));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST 新增说话人：{name, revision}；名称 trim 后非空且同视频内不得重复
+router.post('/videos/:id(\\d+)/speakers', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const name = normalizeSpeakerName(req.body && req.body.name);
+    const expectedRev = parseRosterRevision(req.body);
+    const result = get().transaction(() => {
+      const video = loadVideoRow(videoId);
+      if (video.speakers_revision !== expectedRev) {
+        throw rosterConflict(videoId, '名单修订号已过期：说话人名单已被他人修改，已返回当前名单与归属，请基于当前状态重试');
+      }
+      const rows = listSpeakerRows(videoId);
+      if (rows.some((r) => r.name === name)) {
+        throw new ApiError(422, 'duplicate_speaker_name', `说话人名称「${name}」已存在（去首尾空白后不得重复）`);
+      }
+      const ts = now();
+      const info = get()
+        .prepare('INSERT INTO speakers (video_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)')
+        .run(videoId, name, ts, ts);
+      get().prepare('UPDATE videos SET speakers_revision = speakers_revision + 1 WHERE id = ?').run(videoId);
+      return get().prepare('SELECT * FROM speakers WHERE id = ?').get(info.lastInsertRowid);
+    })();
+    const video = loadVideo(videoId);
+    res.status(201).json({ ok: true, speaker: mapSpeaker(result), ...speakerState(video) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT 修改说话人名称：{name, revision}（名单修订号，非说话人自有版本号）
+router.put('/videos/:id(\\d+)/speakers/:spk(\\d+)', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const speakerId = Number(req.params.spk);
+    const name = normalizeSpeakerName(req.body && req.body.name);
+    const expectedRev = parseRosterRevision(req.body);
+    const result = get().transaction(() => {
+      const video = loadVideoRow(videoId);
+      if (video.speakers_revision !== expectedRev) {
+        throw rosterConflict(videoId, '名单修订号已过期：说话人名单已被他人修改，已返回当前名单与归属，请基于当前状态重试');
+      }
+      const row = get().prepare('SELECT * FROM speakers WHERE id = ? AND video_id = ?').get(speakerId, videoId);
+      if (!row) throw new ApiError(404, 'speaker_not_found', `说话人 #${speakerId} 不存在`);
+      if (row.name === name) {
+        // 名称无变化：不推进修订号
+        return { unchanged: true, row };
+      }
+      const rows = listSpeakerRows(videoId);
+      if (rows.some((r) => r.id !== speakerId && r.name === name)) {
+        throw new ApiError(422, 'duplicate_speaker_name', `说话人名称「${name}」已存在（去首尾空白后不得重复）`);
+      }
+      get().prepare('UPDATE speakers SET name = ?, updated_at = ? WHERE id = ?').run(name, now(), speakerId);
+      get().prepare('UPDATE videos SET speakers_revision = speakers_revision + 1 WHERE id = ?').run(videoId);
+      return { unchanged: false, row: get().prepare('SELECT * FROM speakers WHERE id = ?').get(speakerId) };
+    })();
+    const video = loadVideo(videoId);
+    res.json({ ok: true, speaker: mapSpeaker(result.row), unchanged: result.unchanged, ...speakerState(video) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE 删除说话人（JSON 体带名单修订号 revision）；仍被片段引用时拒绝并返回引用片段清单
+router.delete('/videos/:id(\\d+)/speakers/:spk(\\d+)', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const speakerId = Number(req.params.spk);
+    const expectedRev = parseRosterRevision(req.body);
+    get().transaction(() => {
+      const video = loadVideoRow(videoId);
+      if (video.speakers_revision !== expectedRev) {
+        throw rosterConflict(videoId, '名单修订号已过期：说话人名单已被他人修改，已返回当前名单与归属，请基于当前状态重试');
+      }
+      const row = get().prepare('SELECT * FROM speakers WHERE id = ? AND video_id = ?').get(speakerId, videoId);
+      if (!row) throw new ApiError(404, 'speaker_not_found', `说话人 #${speakerId} 不存在`);
+      const refs = get()
+        .prepare('SELECT id, start_ms, end_ms FROM segments WHERE video_id = ? AND speaker_id = ? ORDER BY start_ms, id')
+        .all(videoId, speakerId);
+      if (refs.length) {
+        throw new ApiError(422, 'speaker_in_use',
+          `说话人「${row.name}」仍被 ${refs.length} 个片段引用，请先把这些片段改归属给其他说话人后再删除`,
+          {
+            speaker: mapSpeaker(row),
+            referenced_segments: refs.map((s) => ({ segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms })),
+          });
+      }
+      get().prepare('DELETE FROM speakers WHERE id = ?').run(speakerId);
+      get().prepare('UPDATE videos SET speakers_revision = speakers_revision + 1 WHERE id = ?').run(videoId);
+    })();
+    const video = loadVideo(videoId);
+    res.json({ ok: true, ...speakerState(video) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT 修改片段归属：{speaker_id, revision}（revision 为所见片段修订号）。
+// speaker_id 为该视频已有说话人 id，或 null（取消归属）。
+// 成功归属：片段修订号 +1、原文转待审；原文文字与时间不变，故译文不因此失效。
+router.put('/videos/:id(\\d+)/segments/:sid(\\d+)/speaker', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const segmentId = Number(req.params.sid);
+    const expectedRev = parseRevision(req.body);
+    const rawSpeaker = req.body && req.body.speaker_id;
+    if (rawSpeaker !== null && (!isInt(rawSpeaker) || rawSpeaker < 1)) {
+      throw new ApiError(422, 'invalid_speaker', 'speaker_id 必须为正整数说话人 id，或 null 表示取消归属');
+    }
+    const result = get().transaction(() => {
+      const video = loadVideoRow(videoId);
+      const seg = get().prepare('SELECT * FROM segments WHERE id = ? AND video_id = ?').get(segmentId, videoId);
+      if (!seg) throw new ApiError(404, 'segment_not_found', `片段 #${segmentId} 不存在`);
+      if (seg.revision !== expectedRev) {
+        throw new ApiError(409, 'revision_conflict',
+          '片段修订号已过期：该片段已被他人修改，已为你加载当前片段、名单与归属，请基于当前内容重试',
+          { current: { segment: mapSegment(seg), ...speakerState(video) } });
+      }
+      let speakerId = null;
+      if (rawSpeaker !== null) {
+        const sp = get().prepare('SELECT * FROM speakers WHERE id = ? AND video_id = ?').get(rawSpeaker, videoId);
+        if (!sp) throw new ApiError(422, 'speaker_not_found', `说话人 #${rawSpeaker} 不存在，请先在名单中新增`);
+        speakerId = sp.id;
+      }
+      if (seg.speaker_id !== speakerId) {
+        // 归属变化：修订号 +1、原文转待审；文字与时间不变 -> 译文不失效
+        get().prepare(
+          'UPDATE segments SET speaker_id = ?, reviewed = 0, revision = revision + 1, updated_at = ? WHERE id = ?'
+        ).run(speakerId, now(), segmentId);
+      }
+      return mapSegment(get().prepare('SELECT * FROM segments WHERE id = ?').get(segmentId));
+    })();
+    const video = loadVideo(videoId);
+    res.json({ ok: true, segment: result, segments: listSegments(videoId), ...speakerState(video) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- 片段拆分（长字幕一分为二，原子完成） ---------------- */
 // 把单个草稿片段在严格位于其起止之间的整数毫秒切点处拆成左右两段：
 // 原片段 ID 保留给左段（修订号 +1），右段获新 ID（修订号从 1 开始）；两段原文均转待审。
 // 启用译文轨道时必须同时提交左右两段非空译文（不能丢弃或直接复制原译文）：
@@ -950,11 +1162,11 @@ router.post('/videos/:id(\\d+)/segments/:sid(\\d+)/split', (req, res, next) => {
       get().prepare(
         'UPDATE segments SET end_ms = ?, text = ?, reviewed = 0, revision = revision + 1, updated_at = ? WHERE id = ?'
       ).run(cutMs, leftText, ts, segmentId);
-      // 右段获新 ID：自切点到原终点，待审，修订号从 1 开始
+      // 右段获新 ID：自切点到原终点，待审，修订号从 1 开始；沿用原片段归属（说话人）
       const rightId = get().prepare(
-        `INSERT INTO segments (video_id, start_ms, end_ms, text, reviewed, revision, updated_at)
-         VALUES (?, ?, ?, ?, 0, 1, ?)`
-      ).run(video.id, cutMs, seg.end_ms, rightText, ts).lastInsertRowid;
+        `INSERT INTO segments (video_id, start_ms, end_ms, text, reviewed, revision, speaker_id, updated_at)
+         VALUES (?, ?, ?, ?, 0, 1, ?, ?)`
+      ).run(video.id, cutMs, seg.end_ms, rightText, seg.speaker_id, ts).lastInsertRowid;
       // 片段时间与文本均变化：该片段全部既有质检放行失效（行保留为历史，理由可查）
       deactivateSegmentQcWaivers(get(), segmentId, ts);
 
@@ -1005,7 +1217,10 @@ router.post('/videos/:id(\\d+)/segments/:sid(\\d+)/split', (req, res, next) => {
 
 // 发布门禁：原文全部已审且时间合法；启用译文轨道时还要求每段译文齐备、
 // 已审且对应当前原文内容（未失效）。pending 逐段列出待处理问题，供工作台定位。
-function publicationStatus(video, segments, translations) {
+// 视频有说话人（名单非空）时，每个片段都必须已归属某说话人，否则阻止发布。
+function publicationStatus(video, segments, translations, speakers) {
+  const speakerRows = speakers || listSpeakerRows(video.id);
+  const hasSpeakers = speakerRows.length > 0;
   const problems = [];
   const pending = [];
   if (segments.length === 0) problems.push('至少需要一个字幕片段才能发布');
@@ -1013,9 +1228,14 @@ function publicationStatus(video, segments, translations) {
   const check = validateTimeline(segments, video.duration_ms);
   if (!check.ok) problems.push(check.reason);
 
+  let unassigned = 0;
   for (const s of segments) {
     const reasons = [];
     if (!s.reviewed) reasons.push('segment_unreviewed');
+    if (hasSpeakers && s.speaker_id == null) {
+      reasons.push('speaker_unassigned');
+      unassigned++;
+    }
     if (video.translation_lang) {
       const tr = translations.find((t) => t.segment_id === s.id);
       if (!tr) reasons.push('translation_missing');
@@ -1028,6 +1248,7 @@ function publicationStatus(video, segments, translations) {
       pending.push({ segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, reasons });
     }
   }
+  if (hasSpeakers && unassigned) problems.push(`说话人名单：${unassigned} 个片段尚未归属说话人`);
 
   let translation = null;
   if (video.translation_lang) {
@@ -1050,7 +1271,15 @@ function publicationStatus(video, segments, translations) {
     if (parts.length) problems.push(`译文轨道（${video.translation_lang}）：${parts.join('、')}`);
   }
 
-  return { canPublish: problems.length === 0, problems, pending, translation };
+  const speakersSummary = hasSpeakers
+    ? {
+        total: speakerRows.length,
+        assigned: segments.filter((s) => s.speaker_id != null).length,
+        unassigned,
+      }
+    : null;
+
+  return { canPublish: problems.length === 0, problems, pending, translation, speakers: speakersSummary };
 }
 
 router.get('/videos/:id(\\d+)/status', (req, res, next) => {
@@ -1121,10 +1350,16 @@ router.post('/videos/:id(\\d+)/publish', (req, res, next) => {
         .prepare('SELECT COALESCE(MAX(version), 0) AS v FROM publications WHERE video_id = ?')
         .get(video.id);
       const version = maxRow.v + 1;
-      // 发布快照固定两轨内容：原文快照结构不变；启用译文轨道时另存译文快照
+      // 发布快照固定两轨内容：原文快照结构不变（逐段额外记录归属 speaker_id）；启用译文轨道时另存译文快照
       const snapshot = JSON.stringify(
-        segments.map((s) => ({ start_ms: s.start_ms, end_ms: s.end_ms, text: s.text }))
+        segments.map((s) => ({ start_ms: s.start_ms, end_ms: s.end_ms, text: s.text, speaker_id: s.speaker_id }))
       );
+      // 固定当时说话人名单（id → 名称）；逐段归属里的 speaker_id 据此解析为名称。
+      // 名单为空（无说话人）时为 NULL —— 旧发布版本形态，SRT 导出等旧语义完全不变。
+      const speakerRows = listSpeakerRows(video.id);
+      const speakersSnapshot = speakerRows.length
+        ? JSON.stringify(speakerRows.map((sp) => ({ id: sp.id, name: sp.name })))
+        : null;
       let translationSnapshot = null;
       if (locked.translation_lang) {
         const bySeg = new Map(translations.map((t) => [t.segment_id, t]));
@@ -1148,11 +1383,11 @@ router.post('/videos/:id(\\d+)/publish', (req, res, next) => {
       const info = get()
         .prepare(
           `INSERT INTO publications (video_id, version, snapshot, translation_snapshot, translation_lang,
-             qc_rules_snapshot, qc_report_snapshot, segment_count, published_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             qc_rules_snapshot, qc_report_snapshot, speakers_snapshot, segment_count, published_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(video.id, version, snapshot, translationSnapshot, locked.translation_lang,
-          qcRulesSnapshot, qcReportSnapshot, segments.length, now());
+          qcRulesSnapshot, qcReportSnapshot, speakersSnapshot, segments.length, now());
       return get().prepare('SELECT * FROM publications WHERE id = ?').get(info.lastInsertRowid);
     })();
     res.status(201).json({ publication: mapPublication(pub) });
@@ -1201,6 +1436,47 @@ router.get('/videos/:id(\\d+)/publications/:version/qc', (req, res, next) => {
       translation_lang: row.translation_lang != null ? row.translation_lang : null,
       rules_snapshot: rules,
       ...report,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 查询某个已发布版本发布时固定的说话人名单与逐段归属（名称与归属在发布时固化）
+router.get('/videos/:id(\\d+)/publications/:version/speakers', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const version = Number(req.params.version);
+    if (!Number.isInteger(version) || version < 1) {
+      throw new ApiError(422, 'invalid_version', 'version 必须为正整数版本号');
+    }
+    const row = get()
+      .prepare('SELECT * FROM publications WHERE video_id = ? AND version = ?')
+      .get(video.id, version);
+    if (!row) throw new ApiError(404, 'version_not_found', `已发布版本 v${version} 不存在`);
+    if (row.speakers_snapshot == null) {
+      // 旧发布版本（发布时尚无说话人名单）保持原行为
+      throw new ApiError(422, 'speakers_unavailable',
+        `发布版本 v${version} 不含说话人快照（发布时该视频尚无说话人名单）；旧发布版本与 SRT 导出行为保持不变`);
+    }
+    const speakers = JSON.parse(row.speakers_snapshot);
+    const nameById = new Map(speakers.map((sp) => [sp.id, sp.name]));
+    const snapshot = JSON.parse(row.snapshot);
+    const assignments = snapshot.map((s, i) => ({
+      index: i + 1,
+      start_ms: s.start_ms,
+      end_ms: s.end_ms,
+      text: s.text,
+      speaker_id: s.speaker_id == null ? null : s.speaker_id,
+      speaker_name: s.speaker_id == null ? null : (nameById.has(s.speaker_id) ? nameById.get(s.speaker_id) : null),
+    }));
+    res.json({
+      video_id: video.id,
+      version: row.version,
+      published_at: row.published_at,
+      snapshot: true,
+      speakers,
+      assignments,
     });
   } catch (err) {
     next(err);
@@ -1386,10 +1662,10 @@ function draftConflicts(existing, entries) {
   return conflicts;
 }
 
-// 草稿快照指纹：任何修改（增删改、审校）都会改变结果
+// 草稿快照指纹：任何修改（增删改、审校、说话人归属）都会改变结果
 function draftFingerprint(segments) {
   const payload = segments
-    .map((s) => [s.id, s.start_ms, s.end_ms, s.text, s.reviewed, s.revision].join('|'))
+    .map((s) => [s.id, s.start_ms, s.end_ms, s.text, s.reviewed, s.revision, s.speaker_id == null ? '' : s.speaker_id].join('|'))
     .join('\n');
   return crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
 }

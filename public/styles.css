@@ -255,3 +255,20 @@ tr.import-conflict td { background: rgba(240,169,59,.12); }
 .good { color: var(--ok); }
 .bad { color: var(--danger); }
 #qcCard hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+
+/* 说话人名单与归属 */
+.speaker-select {
+  width: 100%;
+  max-width: 150px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 12.5px;
+}
+.speaker-select:focus { outline: none; border-color: var(--primary); }
+#speakersCard .seg-table { font-size: 13px; }
+.speaker-name-view { font-weight: 600; }
+.spk-pub-link { margin-left: 6px; color: var(--primary); cursor: pointer; text-decoration: none; }
+.spk-pub-link:hover { text-decoration: underline; }

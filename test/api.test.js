@@ -222,6 +222,7 @@ async function main() {
   await translationTests();
   await shiftTests();
   await splitTests();
+  await speakerTests();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
@@ -1386,6 +1387,356 @@ async function shiftTests() {
   const stFinal = (await req('GET', `/videos/${qv.id}/status`)).json;
   check('status.qc 汇总字段齐备', typeof stFinal.qc.violation_count === 'number' &&
     typeof stFinal.qc.rules_revision === 'number', JSON.stringify(stFinal.qc));
+}
+
+async function speakerTests() {
+  console.log('38. 说话人名单：增改名、trim、空/重复校验与名单修订号');
+  const sv = await uploadVideo('说话人视频', 10000, 48);
+  const getRoster = async () => (await req('GET', `/videos/${sv.id}/speakers`)).json;
+
+  let r = await req('GET', `/videos/${sv.id}/speakers`);
+  check('空名单 200', r.status === 200);
+  eq('初始名单修订号为 0', r.json.speakers_revision, 0);
+  eq('初始名单为空', r.json.speakers, []);
+  eq('初始归属为空', r.json.assignments, []);
+
+  // 名称：trim 后非空；缺修订号 / 空 / 纯空白 / 非字符串
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '  张三  ' });
+  check('新增缺修订号 -> 422', r.status === 422 && r.json.error.code === 'missing_revision');
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '   ', revision: 0 });
+  check('空白名称 -> 422 invalid_speaker_name', r.status === 422 && r.json.error.code === 'invalid_speaker_name');
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '', revision: 0 });
+  check('空名称 -> 422', r.status === 422 && r.json.error.code === 'invalid_speaker_name');
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: 42, revision: 0 });
+  check('非字符串名称 -> 422', r.status === 422 && r.json.error.code === 'invalid_speaker_name');
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '张三', revision: -1 });
+  check('负修订号 -> 422', r.status === 422 && r.json.error.code === 'missing_revision');
+
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '  张三  ', revision: 0 });
+  check('新增说话人 201', r.status === 201, JSON.stringify(r.json));
+  const zhang = r.json.speaker;
+  eq('名称被 trim 后保存', zhang.name, '张三');
+  eq('新增后名单修订号为 1', r.json.speakers_revision, 1);
+  eq('回包包含当前名单', r.json.speakers.map((x) => x.name), ['张三']);
+
+  // 重复（trim 后比较，含空白差异）
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '张三', revision: 1 });
+  check('重复名称 -> 422 duplicate_speaker_name', r.status === 422 && r.json.error.code === 'duplicate_speaker_name');
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: ' 张三  ', revision: 1 });
+  check('仅空白差异也算重复 -> 422', r.status === 422 && r.json.error.code === 'duplicate_speaker_name');
+  eq('重复不推进修订号', (await getRoster()).speakers_revision, 1);
+
+  // 过期名单修订号 -> 409 与当前状态
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '李四', revision: 0 });
+  check('过期新增 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict');
+  eq('409 返回当前名单修订号', r.json.error.speakers_revision, 1);
+  eq('409 返回当前名单', r.json.error.speakers.map((x) => x.name), ['张三']);
+  check('409 返回逐段归属', Array.isArray(r.json.error.assignments));
+
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '李四', revision: 1 });
+  check('携带正确修订号新增第二人', r.status === 201);
+  const li = r.json.speaker;
+  eq('名单修订号为 2', r.json.speakers_revision, 2);
+
+  // 改名
+  r = await req('PUT', `/videos/${sv.id}/speakers/${zhang.id}`, { name: '张三(主播)', revision: 2 });
+  check('改名成功 200', r.status === 200);
+  eq('改名后修订号 +1', r.json.speakers_revision, 3);
+  eq('回包名称已更新', r.json.speaker.name, '张三(主播)');
+  // 改成与他人重复
+  r = await req('PUT', `/videos/${sv.id}/speakers/${zhang.id}`, { name: '李四', revision: 3 });
+  check('改成重名 -> 422', r.status === 422 && r.json.error.code === 'duplicate_speaker_name');
+  // 改成自己原名（无变化）：幂等，不推进修订号
+  r = await req('PUT', `/videos/${sv.id}/speakers/${zhang.id}`, { name: '张三(主播)', revision: 3 });
+  check('名称无变化 -> 200 unchanged', r.status === 200 && r.json.unchanged === true);
+  eq('无变化不推进修订号', r.json.speakers_revision, 3);
+  // 改不存在的说话人
+  r = await req('PUT', `/videos/${sv.id}/speakers/999999`, { name: '谁', revision: 3 });
+  check('改不存在说话人 -> 404', r.status === 404 && r.json.error.code === 'speaker_not_found');
+  // 过期改名
+  r = await req('PUT', `/videos/${sv.id}/speakers/${zhang.id}`, { name: '王五', revision: 0 });
+  check('过期改名 -> 409', r.status === 409 && r.json.error.speakers_revision === 3);
+
+  // 被引用前可以删除；删除也持名单修订号
+  r = await req('DELETE', `/videos/${sv.id}/speakers/${li.id}`, { revision: 2 });
+  check('过期删除 -> 409', r.status === 409 && r.json.error.speakers_revision === 3);
+  r = await req('DELETE', `/videos/${sv.id}/speakers/${li.id}`, { revision: 3 });
+  check('删除未引用说话人成功', r.status === 200, JSON.stringify(r.json));
+  eq('删除后修订号 +1', r.json.speakers_revision, 4);
+  eq('删除后名单只剩张三(主播)', r.json.speakers.map((x) => x.name), ['张三(主播)']);
+  r = await req('DELETE', `/videos/${sv.id}/speakers/${li.id}`, { revision: 4 });
+  check('重复删除 -> 404', r.status === 404 && r.json.error.code === 'speaker_not_found');
+  // 重新加回李四用于后续
+  r = await req('POST', `/videos/${sv.id}/speakers`, { name: '李四', revision: 4 });
+  check('重新新增李四', r.status === 201);
+  const li2 = r.json.speaker;
+  eq('名单修订号为 5', r.json.speakers_revision, 5);
+
+  // 未知视频名单 -> 404
+  r = await req('GET', '/videos/999999/speakers');
+  check('未知视频名单 -> 404', r.status === 404);
+
+  console.log('39. 片段归属：修订号、修订号 +1/转待审、文字时间与译文不变');
+  const add = async (s, e, t) =>
+    (await req('POST', `/videos/${sv.id}/segments`, { start_ms: s, end_ms: e, text: t })).json.segment;
+  const segA = await add(1000, 2000, '第一句');
+  const segB = await add(3000, 4000, '第二句');
+  eq('新片段默认未归属', [segA.speaker_id, segB.speaker_id], [null, null]);
+
+  // 启用译文轨道并给 segA 录译文，验证归属变化不使译文失效
+  await req('PUT', `/videos/${sv.id}/translation/track`, { language: 'en' });
+  await req('PUT', `/videos/${sv.id}/segments/${segA.id}/translation`, { text: 'First', segment_revision: 1 });
+
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: zhang.id });
+  check('归属缺片段修订号 -> 422', r.status === 422 && r.json.error.code === 'missing_revision');
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: 999999, revision: 1 });
+  check('归属到不存在说话人 -> 422 speaker_not_found', r.status === 422 && r.json.error.code === 'speaker_not_found');
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: 'x', revision: 1 });
+  check('非法 speaker_id -> 422 invalid_speaker', r.status === 422 && r.json.error.code === 'invalid_speaker');
+
+  // segA 先标记已审，归属后应转待审
+  await req('POST', `/videos/${sv.id}/segments/${segA.id}/review`, { reviewed: true, revision: 1 });
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: zhang.id, revision: 2 });
+  check('归属成功 200', r.status === 200, JSON.stringify(r.json));
+  eq('归属后片段修订号 +1', r.json.segment.revision, 3);
+  eq('归属后转待审', r.json.segment.reviewed, false);
+  eq('归属后 speaker_id', r.json.segment.speaker_id, zhang.id);
+  eq('归属不改变原文文字与时间', [r.json.segment.start_ms, r.json.segment.end_ms, r.json.segment.text],
+    [1000, 2000, '第一句']);
+  // 译文：文字与时间未变 -> 不失效
+  const trA = (await req('GET', `/videos/${sv.id}`)).json.translations.find((t) => t.segment_id === segA.id);
+  eq('归属变化不使译文失效', trA.stale, false);
+
+  // 重复归属同一说话人：幂等，不加修订号
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: zhang.id, revision: 3 });
+  check('重复同归属 -> 200', r.status === 200);
+  eq('重复归属不推进修订号', r.json.segment.revision, 3);
+
+  // 过期片段修订号 -> 409，current 携带片段与名单
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: li2.id, revision: 1 });
+  check('过期归属 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict');
+  eq('409 current 片段修订号', r.json.error.current.segment.revision, 3);
+  eq('409 current 含名单修订号', r.json.error.current.speakers_revision, 5);
+  check('409 current 含名单与归属',
+    Array.isArray(r.json.error.current.speakers) && Array.isArray(r.json.error.current.assignments));
+
+  // 改归属给李四：修订号 +1、再转待审（本来已待审）
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: li2.id, revision: 3 });
+  check('改归属成功', r.status === 200 && r.json.segment.speaker_id === li2.id);
+  eq('改归属修订号 +1', r.json.segment.revision, 4);
+
+  // 取消归属（null）
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: null, revision: 4 });
+  check('取消归属成功', r.status === 200 && r.json.segment.speaker_id === null);
+  eq('取消归属修订号 +1', r.json.segment.revision, 5);
+  // 再取消（已是 null）：幂等
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: null, revision: 5 });
+  eq('重复取消不推进修订号', r.json.segment.revision, 5);
+  // 片段不存在
+  r = await req('PUT', `/videos/${sv.id}/segments/999999/speaker`, { speaker_id: zhang.id, revision: 1 });
+  check('归属不存在片段 -> 404', r.status === 404 && r.json.error.code === 'segment_not_found');
+  // segB 归属张三
+  r = await req('PUT', `/videos/${sv.id}/segments/${segB.id}/speaker`, { speaker_id: zhang.id, revision: 1 });
+  check('segB 归属张三', r.status === 200 && r.json.segment.revision === 2);
+
+  // 工作台可查看归属：详情、名单接口
+  let detail = (await req('GET', `/videos/${sv.id}`)).json;
+  eq('详情携带名单修订号', detail.speakers_revision, 5);
+  eq('详情携带名单', detail.speakers.map((x) => x.name).sort(), ['张三(主播)', '李四']);
+  const roster = await getRoster();
+  eq('名单接口逐段归属', Object.fromEntries(roster.assignments.map((a) => [a.segment_id, a.speaker_id])),
+    { [segA.id]: null, [segB.id]: zhang.id });
+
+  console.log('40. 引用保护：被片段引用的说话人不得删除（含 422 清单）');
+  r = await req('DELETE', `/videos/${sv.id}/speakers/${zhang.id}`, { revision: 5 });
+  check('删除被引用说话人 -> 422 speaker_in_use', r.status === 422 && r.json.error.code === 'speaker_in_use');
+  eq('422 返回引用片段清单', r.json.error.referenced_segments.map((x) => x.segment_id), [segB.id]);
+  eq('拒绝删除不推进修订号', (await getRoster()).speakers_revision, 5);
+  // 把 segB 改归属给李四后，张三(主播)可删
+  r = await req('PUT', `/videos/${sv.id}/segments/${segB.id}/speaker`, { speaker_id: li2.id, revision: 2 });
+  check('segB 改归属李四', r.status === 200);
+  r = await req('DELETE', `/videos/${sv.id}/speakers/${zhang.id}`, { revision: 5 });
+  check('无引用后删除成功', r.status === 200);
+  eq('删除后修订号 +1', r.json.speakers_revision, 6);
+  eq('已归属片段的 speaker_id 不受影响（张三人已删但此处 segB 已改）',
+    r.json.assignments.find((a) => a.segment_id === segB.id).speaker_id, li2.id);
+
+  console.log('41. 发布门禁：有说话人时未归属阻止发布并返回清单');
+  // 当前：名单只有李四；segA 未归属、segB 归属李四
+  // 补齐双轨（segB 译文），让未归属成为唯一阻塞项
+  await req('PUT', `/videos/${sv.id}/segments/${segB.id}/translation`, { text: 'Second', segment_revision: 3 });
+  await req('POST', `/videos/${sv.id}/segments/${segB.id}/translation/review`,
+    { reviewed: true, segment_revision: 3, revision: 1 });
+  await req('POST', `/videos/${sv.id}/segments/${segB.id}/review`, { reviewed: true, revision: 3 });
+  // segA 当前 rev 5（未审）：先审译文（带所见原文修订号 5），再审原文 -> 唯一阻塞只剩未归属
+  await req('POST', `/videos/${sv.id}/segments/${segA.id}/translation/review`,
+    { reviewed: true, segment_revision: 5, revision: 1 });
+  await req('POST', `/videos/${sv.id}/segments/${segA.id}/review`, { reviewed: true, revision: 5 });
+  r = await req('GET', `/videos/${sv.id}/status`);
+  check('status 报告未归属计数', r.json.speakers.total === 1 && r.json.speakers.unassigned === 1 &&
+    r.json.speakers.assigned === 1, JSON.stringify(r.json.speakers));
+  check('canPublish=false', r.json.canPublish === false);
+  r = await req('POST', `/videos/${sv.id}/publish`, {});
+  check('未归属阻止发布 -> 422', r.status === 422 && r.json.error.code === 'not_publishable');
+  check('消息提示未归属', /尚未归属说话人/.test(r.json.error.message), r.json.error.message);
+  eq('pending 指出未归属片段（唯一原因）',
+    r.json.error.pending.find((p) => p.segment_id === segA.id).reasons, ['speaker_unassigned']);
+  eq('未生成版本', (await req('GET', `/videos/${sv.id}/publications`)).json.publications.length, 0);
+
+  // segA 归属（rev 6 -> 7、转待审）：译文不失效、译文审校不被归属撤销；再审原文即可发布
+  r = await req('PUT', `/videos/${sv.id}/segments/${segA.id}/speaker`, { speaker_id: li2.id, revision: 6 });
+  check('segA 归属', r.status === 200, JSON.stringify(r.json));
+  eq('归属后修订号为 7 且转待审', [r.json.segment.revision, r.json.segment.reviewed], [7, false]);
+  // 译文仍未失效（归属不动文字/时间）
+  const trStill = (await req('GET', `/videos/${sv.id}`)).json.translations.find((t) => t.segment_id === segA.id);
+  eq('归属译文不失效', trStill.stale, false);
+  // 译文仍已审（归属不撤销译文审校）
+  eq('归属不撤销译文审校状态', trStill.reviewed, true);
+  await req('POST', `/videos/${sv.id}/segments/${segA.id}/review`, { reviewed: true, revision: 7 });
+  r = await req('POST', `/videos/${sv.id}/publish`, {});
+  check('双轨 + 全归属发布 v1 成功', r.status === 201 && r.json.publication.version === 1, JSON.stringify(r.json));
+  eq('版本标记含说话人', r.json.publication.has_speakers, true);
+  eq('版本同时含译文', r.json.publication.has_translation, true);
+
+  console.log('42. 发布固化：快照接口、改名/改草稿不影响历史；旧版本语义不变');
+  // v1 快照：逐段归属李四，名称固定
+  r = await req('GET', `/videos/${sv.id}/publications/1/speakers`);
+  check('版本说话人快照 200', r.status === 200);
+  eq('快照标记', r.json.snapshot, true);
+  eq('快照固定名单', r.json.speakers.map((x) => [x.id, x.name]), [[li2.id, '李四']]);
+  eq('快照逐段归属名称', r.json.assignments.map((a) => [a.speaker_id, a.speaker_name]),
+    [[li2.id, '李四'], [li2.id, '李四']]);
+  // 发布后改名李四 -> 李四(嘉宾)
+  r = await req('PUT', `/videos/${sv.id}/speakers/${li2.id}`, { name: '李四(嘉宾)', revision: 6 });
+  check('发布后改名成功', r.status === 200 && r.json.speakers_revision === 7);
+  r = await req('GET', `/videos/${sv.id}/publications/1/speakers`);
+  eq('历史快照名称不随后续改名变化', r.json.speakers.map((x) => x.name), ['李四']);
+  eq('历史归属名称仍是李四', r.json.assignments.every((a) => a.speaker_name === '李四'), true);
+  // 发布后改草稿文字：历史快照文字不变
+  const aNow = (await req('GET', `/videos/${sv.id}`)).json.segments.find((x) => x.id === segA.id);
+  await req('PUT', `/videos/${sv.id}/segments/${segA.id}`,
+    { start_ms: aNow.start_ms, end_ms: aNow.end_ms, text: '第一句(草稿改)', revision: aNow.revision });
+  r = await req('GET', `/videos/${sv.id}/publications/1/speakers`);
+  eq('历史快照文本不受草稿修改影响', r.json.assignments.find((a) => a.start_ms === 1000).text, '第一句');
+  // 历史原文 SRT 导出语义不变（不含说话人列）
+  const v1Srt = await (await fetch(`${BASE}/videos/${sv.id}/srt?version=1`)).text();
+  check('v1 原文 SRT 仍可导出且不含归属信息', /第一句/.test(v1Srt) && !/李四/.test(v1Srt), v1Srt);
+
+  // 不存在版本 / 无说话人旧版本
+  r = await req('GET', `/videos/${sv.id}/publications/99/speakers`);
+  check('不存在版本快照 -> 404', r.status === 404 && r.json.error.code === 'version_not_found');
+
+  console.log('43. 拆分沿用归属；SRT 导入与区间恢复产生的新片段未归属');
+  const pv = await uploadVideo('拆分归属', 10000, 48);
+  // 名单两人
+  let p = await req('POST', `/videos/${pv.id}/speakers`, { name: '主持人', revision: 0 });
+  const host = p.json.speaker.id;
+  await req('POST', `/videos/${pv.id}/speakers`, { name: '嘉宾', revision: 1 });
+  const pSeg = (await req('POST', `/videos/${pv.id}/segments`,
+    { start_ms: 1000, end_ms: 3000, text: '一整句需要拆开' })).json.segment;
+  await req('PUT', `/videos/${pv.id}/segments/${pSeg.id}/speaker`, { speaker_id: host, revision: 1 });
+  // 拆分：左右两段沿用原归属
+  r = await req('POST', `/videos/${pv.id}/segments/${pSeg.id}/split`,
+    { cut_ms: 2000, left_text: '前半', right_text: '后半', revision: 2 });
+  check('拆分成功', r.status === 201, JSON.stringify(r.json));
+  eq('左段沿用原归属', r.json.left.speaker_id, host);
+  eq('右段沿用原归属', r.json.right.speaker_id, host);
+  eq('右段是新片段（修订号从 1）', [r.json.right.revision, r.json.right.reviewed], [1, false]);
+
+  // SRT 整稿替换产生的新片段未归属
+  const srtContent = '1\n00:00:04,000 --> 00:00:05,000\n导入片段';
+  p = await req('POST', `/videos/${pv.id}/srt/preview`, { content: srtContent });
+  r = await req('POST', `/videos/${pv.id}/srt/import`, { content: srtContent, mode: 'replace', token: p.json.token });
+  check('SRT 替换成功', r.status === 201);
+  eq('SRT 导入新片段未归属', r.json.segments.map((s) => s.speaker_id), [null]);
+  eq('SRT 导入新片段待审修订号 1', [r.json.segments[0].reviewed, r.json.segments[0].revision], [false, 1]);
+
+  // 区间恢复：先发布（归属齐），再用恢复把当前未归属片段换成恢复片段（也未归属）
+  const impId = r.json.segments[0].id;
+  await req('PUT', `/videos/${pv.id}/segments/${impId}/speaker`, { speaker_id: host, revision: 1 });
+  await req('POST', `/videos/${pv.id}/segments/${impId}/review`, { reviewed: true, revision: 2 });
+  // 只有一个片段时时间线 4000-5000，先发布 v1
+  r = await req('POST', `/videos/${pv.id}/publish`, {});
+  check('发布 v1（全归属）', r.status === 201 && r.json.publication.has_speakers === true, JSON.stringify(r.json));
+  // 再 SRT 替换成另一段未归属新片段
+  const srt2 = '1\n00:00:06,000 --> 00:00:07,000\n另一草稿';
+  p = await req('POST', `/videos/${pv.id}/srt/preview`, { content: srt2 });
+  r = await req('POST', `/videos/${pv.id}/srt/import`, { content: srt2, mode: 'replace', token: p.json.token });
+  const draftId = r.json.segments[0].id;
+  check('替换后新片段未归属', r.json.segments[0].speaker_id === null);
+  // 恢复 v1 的 0..10000 区间：恢复片段为新片段，未归属
+  p = await req('POST', `/videos/${pv.id}/restore/preview`, { version: 1, start_ms: 0, end_ms: 10000 });
+  check('恢复预览 200', p.status === 200, JSON.stringify(p.json));
+  r = await req('POST', `/videos/${pv.id}/restore/confirm`,
+    { version: 1, start_ms: 0, end_ms: 10000, token: p.json.token });
+  check('恢复确认 201', r.status === 201, JSON.stringify(r.json));
+  eq('恢复产生的新片段未归属', r.json.restored.map((s) => s.speaker_id), [null]);
+  eq('恢复片段待审、修订号从 1', r.json.restored.map((s) => [s.reviewed, s.revision]), [[false, 1]]);
+  // 未归属阻止再次发布
+  r = await req('POST', `/videos/${pv.id}/publish`, {});
+  check('恢复后未归属阻止发布', r.status === 422 &&
+    r.json.error.pending.some((q) => q.reasons.includes('speaker_unassigned')), JSON.stringify(r.json));
+  // v1 历史快照的归属仍然可查且不随后续操作变化
+  r = await req('GET', `/videos/${pv.id}/publications/1/speakers`);
+  eq('v1 快照归属固定（主持人）',
+    r.json.assignments.map((a) => [a.speaker_name, a.text]), [['主持人', '导入片段']]);
+
+  console.log('44. 无说话人视频门禁与旧版本形态完全不变');
+  const nv = await uploadVideo('无说话人', 8000, 40);
+  const n1 = (await req('POST', `/videos/${nv.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '无名单' })).json.segment;
+  await req('POST', `/videos/${nv.id}/segments/${n1.id}/review`, { reviewed: true, revision: 1 });
+  r = await req('GET', `/videos/${nv.id}/status`);
+  check('无名单时 speakers 汇总为 null', r.json.speakers === null);
+  eq('无名单时 pending 不含归属原因', r.json.pending, []);
+  r = await req('POST', `/videos/${nv.id}/publish`, {});
+  check('无名单视频按原门禁发布', r.status === 201);
+  eq('无名单版本 has_speakers=false', r.json.publication.has_speakers, false);
+  r = await req('GET', `/videos/${nv.id}/publications/1/speakers`);
+  check('无名单版本快照接口 -> 422 speakers_unavailable',
+    r.status === 422 && r.json.error.code === 'speakers_unavailable', JSON.stringify(r.json));
+  // 无名单版本原文 SRT 语义不变
+  const nSrt = await (await fetch(`${BASE}/videos/${nv.id}/srt?version=1`)).text();
+  check('无名单版本 SRT 不变', /无名单/.test(nSrt));
+
+  console.log('45. 归属属于草稿修改：预览令牌随之失效；仅名单增删不影响片段令牌');
+  const tv2 = await uploadVideo('令牌与归属', 10000, 40);
+  const c1 = (await req('POST', `/videos/${tv2.id}/segments`,
+    { start_ms: 1000, end_ms: 2000, text: '甲' })).json.segment;
+  const c2 = (await req('POST', `/videos/${tv2.id}/segments`,
+    { start_ms: 3000, end_ms: 4000, text: '乙' })).json.segment;
+  // 先预览「平移 c2」，随后把 c1 归属给新说话人 -> 草稿指纹变化 -> 确认必须 409
+  let pp = await req('POST', `/videos/${tv2.id}/segments/shift/preview`,
+    { segment_ids: [c2.id], offset_ms: 500 });
+  check('平移预览 200', pp.status === 200);
+  let addSp = await req('POST', `/videos/${tv2.id}/speakers`, { name: '解说', revision: 0 });
+  check('新增说话人', addSp.status === 201);
+  const nar = await req('PUT', `/videos/${tv2.id}/segments/${c1.id}/speaker`,
+    { speaker_id: addSp.json.speaker.id, revision: 1 });
+  check('归属 c1', nar.status === 200);
+  let cf = await req('POST', `/videos/${tv2.id}/segments/shift/confirm`,
+    { segment_ids: [c2.id], offset_ms: 500, token: pp.json.token });
+  check('预览后仅归属变化 -> 确认 409 draft_changed', cf.status === 409 && cf.json.error.code === 'draft_changed',
+    JSON.stringify(cf.json));
+  check('409 返回当前片段（含归属）',
+    cf.json.error.current_segments.find((s) => s.id === c1.id).speaker_id === addSp.json.speaker.id);
+
+  // 反过来：预览后只做名单增删（不改任何片段）-> 片段指纹不变 -> 确认仍成功
+  pp = await req('POST', `/videos/${tv2.id}/segments/shift/preview`,
+    { segment_ids: [c2.id], offset_ms: 500 });
+  addSp = await req('POST', `/videos/${tv2.id}/speakers`, { name: '旁白', revision: addSp.json.speakers_revision });
+  check('仅再新增一名说话人', addSp.status === 201);
+  const okShift = await req('POST', `/videos/${tv2.id}/segments/shift/confirm`,
+    { segment_ids: [c2.id], offset_ms: 500, token: pp.json.token });
+  check('仅名单增删不影响片段平移令牌 -> 201', okShift.status === 201, JSON.stringify(okShift.json));
+  eq('平移后 c2 仍未归属（新归属不随平移产生）',
+    okShift.json.segments.find((s) => s.id === c2.id).speaker_id, null);
+
+  // SRT 导入预览后改归属 -> 确认 409
+  const srtC = '1\n00:00:08,000 --> 00:00:09,000\n追加句';
+  pp = await req('POST', `/videos/${tv2.id}/srt/preview`, { content: srtC });
+  await req('POST', `/videos/${tv2.id}/segments/${c1.id}/review`, { reviewed: true, revision: 2 });
+  cf = await req('POST', `/videos/${tv2.id}/srt/import`, { content: srtC, mode: 'append', token: pp.json.token });
+  check('SRT 预览后片段审校/归属变化 -> 409', cf.status === 409 && cf.json.error.code === 'draft_changed');
 }
 
 async function splitTests() {
