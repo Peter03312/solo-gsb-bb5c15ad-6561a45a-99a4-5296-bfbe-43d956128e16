@@ -22,6 +22,7 @@ function init(dbPath) {
       size_bytes    INTEGER NOT NULL,
       duration_ms   INTEGER NOT NULL CHECK (duration_ms > 0),
       translation_lang TEXT,
+      speakers_revision INTEGER NOT NULL DEFAULT 0,
       created_at    INTEGER NOT NULL
     );
 
@@ -33,11 +34,26 @@ function init(dbPath) {
       text       TEXT    NOT NULL DEFAULT '',
       reviewed   INTEGER NOT NULL DEFAULT 0 CHECK (reviewed IN (0, 1)),
       revision   INTEGER NOT NULL DEFAULT 1,
+      speaker_id INTEGER REFERENCES speakers(id) ON DELETE SET NULL,
       updated_at INTEGER NOT NULL,
       UNIQUE (video_id, id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_segments_video ON segments(video_id, start_ms);
+
+    -- 说话人名单：每个视频独立维护；名称去首尾空白后非空、不换行且同视频唯一（精确比较）。
+    -- videos.speakers_revision 为名单的乐观锁：任何增删改都必须携带所见名单修订号。
+    -- 仍被草稿片段引用的说话人不得删除（应用层在事务内先查引用，引用计数见 segments.speaker_id）。
+    CREATE TABLE IF NOT EXISTS speakers (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      video_id   INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+      name       TEXT    NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE (video_id, name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_speakers_video ON speakers(video_id, id);
 
     CREATE TABLE IF NOT EXISTS publications (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +64,7 @@ function init(dbPath) {
       translation_lang     TEXT,
       qc_rules_snapshot    TEXT,
       qc_report_snapshot   TEXT,
+      speaker_snapshot     TEXT,
       segment_count INTEGER NOT NULL,
       published_at INTEGER NOT NULL,
       UNIQUE (video_id, version)
@@ -119,6 +136,16 @@ function init(dbPath) {
   if (!videoCols.includes('translation_lang')) {
     db.exec('ALTER TABLE videos ADD COLUMN translation_lang TEXT');
   }
+  if (!videoCols.includes('speakers_revision')) {
+    db.exec('ALTER TABLE videos ADD COLUMN speakers_revision INTEGER NOT NULL DEFAULT 0');
+  }
+  const segCols = db.prepare('PRAGMA table_info(segments)').all().map((c) => c.name);
+  if (!segCols.includes('speaker_id')) {
+    // speakers 表已由上方 CREATE IF NOT EXISTS 建好；旧片段默认未归属（NULL）
+    db.exec('ALTER TABLE segments ADD COLUMN speaker_id INTEGER REFERENCES speakers(id) ON DELETE SET NULL');
+  }
+  // 新库与已完成加列的旧库都确保存在归属索引（旧库 speaker_id 列不存在时不能提前建）
+  db.exec('CREATE INDEX IF NOT EXISTS idx_segments_speaker ON segments(speaker_id)');
   const pubCols = db.prepare('PRAGMA table_info(publications)').all().map((c) => c.name);
   if (!pubCols.includes('translation_snapshot')) {
     db.exec('ALTER TABLE publications ADD COLUMN translation_snapshot TEXT');
@@ -131,6 +158,9 @@ function init(dbPath) {
   }
   if (!pubCols.includes('qc_report_snapshot')) {
     db.exec('ALTER TABLE publications ADD COLUMN qc_report_snapshot TEXT');
+  }
+  if (!pubCols.includes('speaker_snapshot')) {
+    db.exec('ALTER TABLE publications ADD COLUMN speaker_snapshot TEXT');
   }
 
   return db;

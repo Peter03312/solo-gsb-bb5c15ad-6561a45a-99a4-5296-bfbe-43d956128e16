@@ -59,6 +59,15 @@
   - **发布时服务端重新质检**：未放行的违规阻止发布、返回完整违规清单且**不产生版本**；成功发布的版本可查到**固定的规则、质检结果与有效放行**（发布后再改草稿不影响版本快照）；
   - **原有审校门禁始终适用**（未审/译文缺失/失效/待审照样阻止发布）；**未配置阈值的轨道不增加任何阻断**；**译文未启用时只检查原文**；旧发布版本（无质检快照）及其 SRT 导出行为完全不变；
   - 规则与放行都走**乐观锁并发控制**：规则修改携带 `rules_revision`（首次传 `0`），译文放行同时携带原文/译文双修订号；过期提交返回 `409` 与当前状态，绝不覆盖他人修改；规则阈值变化会使既有放行整体失效（历史保留）。
+- **说话人名单与片段归属（按视频维护）**：
+  - 工作台可按视频**增、删、改说话人名单**；名称**去首尾空白**后不得为空、不得含换行、同视频内**不得重复**（跨视频同名允许）；
+  - 每个草稿原文片段可**归属到一名说话人**（也可置回未归属）；**拆分出的左右两段沿用原归属**，**SRT 导入与历史区间恢复产生的新片段一律未归属**；
+  - 名单的增删改携带**所见名单修订号 `list_revision`**（首次传 `0`），归属修改携带**所见片段修订号 `revision`**；过期返回 `409` 与当前名单/片段状态，绝不覆盖他人修改；
+  - **仍被草稿片段引用的说话人不得删除**（`422`，返回引用片段清单），须先把相关片段改归属到他人或置为未归属；
+  - 成功归属使**片段修订号 +1 且原文转待审**，但**原文文字与时间不变**；因此**译文不会仅因归属变化而失效**（译文仍只因原文文字或时间变化而失效），译文审校状态保留；
+  - **视频存在说话人时，未归属片段阻止发布**，失败返回逐段清单（原因 `speaker_unassigned`，不产生版本）；没有说话人的视频门禁与旧版本完全一致；
+  - 成功发布**固定当时的说话人名称与逐段归属**（说话人快照）；之后改名、增删说话人或修改草稿归属都**不影响历史版本**（草稿立即显示新名）；可查询任一发布版本固定的说话人快照；
+  - **原有 SRT 导出（原文/译文、草稿/历史版本）与旧发布版本语义完全不变**：SRT 不含说话人信息；无说话人名单时发布的旧版本没有说话人快照。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -99,7 +108,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝，以及片段拆分的切点校验/双修订号/双段译文/复制禁止/放行失效/历史版本不可变等 485 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝，片段拆分的切点校验/双修订号/双段译文/复制禁止/放行失效/历史版本不可变，以及说话人名单 trim/去重/名单修订号/删除引用保护、片段归属修订号/转待审/译文不失效、未归属阻止发布与名称-归属快照不可变、拆分沿用与导入/恢复新片段未归属等 571 个断言）：
 
 ```bash
 npm test
@@ -150,6 +159,9 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
    点击时间定位到片段；对单项违规点「填写理由放行」（原文放行带原文修订号，译文放行带原文+译文双修订号）。
    发布时服务端会重新质检，未放行违规阻止发布；发布成功后可在历史版本处「查看质检快照」核对当时固定的规则、结果与放行。
 10. 用「下载 SRT ▾」选择原文或译文的草稿/任一已发布版本导出（译文导出要求该范围译文齐备且未失效）。
+11. 需要区分说话人时，在右侧「说话人名单」卡片「新增说话人」（如主持人、嘉宾A），再在片段表「说话人」列下拉里
+    逐段归属；归属成功会让该段原文转**待审**（文字、时间与译文不变，需重新审校）。被片段引用的说话人不能删除，
+    须先改这些片段的归属。存在说话人后，未归属片段会阻止发布；发布固定当时名称与逐段归属，之后改名或改草稿不影响历史版本。
 
 ## HTTP API 摘要
 
@@ -157,7 +169,8 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`；片段拆分在已有译文时还须携带
 所见译文修订号 `translation_revision`）。
 质检规则修改携带所见规则修订号 `rules_revision`（首次配置传 `0`）；质检放行携带 `segment_revision`，
-译文放行还需译文 `revision`；过期一律 `409 revision_conflict` 并返回当前状态。
+译文放行还需译文 `revision`；**说话人名单增删改携带所见名单修订号 `list_revision`（首次传 `0`），片段归属修改携带
+所见片段修订号 `revision`**；过期一律 `409 revision_conflict` 并返回当前状态。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -170,6 +183,12 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `POST` | `/api/videos/:id/segments/:sid/split` | 拆分片段 `{cut_ms,left_text,right_text,revision[,left_translation,right_translation,translation_revision]}`，原子拆为左右两段 |
 | `DELETE` | `/api/videos/:id/segments/:sid` | 删除（JSON 体带 `revision`） |
 | `POST` | `/api/videos/:id/segments/:sid/review` | 审校切换 `{reviewed,revision}` |
+| `GET` | `/api/videos/:id/speakers` | 说话人名单（含每个说话人 `usage_count`）与未归属片段 `unassigned_segment_ids`、`list_revision` |
+| `POST` | `/api/videos/:id/speakers` | 新增说话人 `{name,list_revision}`（名称 trim 后非空、不换行、同视频唯一） |
+| `PUT` | `/api/videos/:id/speakers/:spid` | 改名 `{name,list_revision}`（历史发布快照不变） |
+| `DELETE` | `/api/videos/:id/speakers/:spid` | 删除说话人（JSON 体带 `list_revision`）；仍被片段引用时 `422 speaker_in_use` |
+| `PUT` | `/api/videos/:id/segments/:sid/speaker` | 修改片段归属 `{speaker_id,revision}`（`speaker_id` 为 `null` 表示未归属）；片段修订号 +1、转待审，文字/时间/译文不变 |
+| `GET` | `/api/videos/:id/publications/:version/speakers` | 查询某发布版本固定的说话人名单与逐段归属（旧版本无快照时 `422 speakers_unavailable`） |
 | `GET` | `/api/videos/:id/status` | 发布门禁检查 |
 | `POST` | `/api/videos/:id/publish` | 发布不可变版本 |
 | `GET` | `/api/videos/:id/publications` | 已发布版本列表 |
@@ -596,11 +615,98 @@ curl -s http://localhost:8080/api/videos/$V/publications/3/qc
 | `422 qc_blocked` | 发布重新质检发现未放行违规；`error.qc_violations[]` 为完整清单，未生成版本 |
 | `422 qc_unavailable` | 指定发布版本不含质检快照（发布时未配置阈值），旧版本行为不变 |
 
-## 数据布局
+### 说话人名单与片段归属调用示例
 
+每个视频维护独立的说话人名单，并把草稿原文片段逐段归属到一名说话人。名单写操作（增/改/删）携带
+**所见名单修订号 `list_revision`**（首次传 `0`）；归属修改携带**所见片段修订号 `revision`**。
+归属成功只让片段转待审、修订号 +1，**原文文字与时间、译文都不变**（译文不会因此失效）。
+
+```bash
+V=12
+
+# 1) 查看名单（含引用计数）与未归属片段
+curl -s http://localhost:8080/api/videos/$V/speakers
+# -> { "list_revision": 0, "speakers": [], "unassigned_segment_ids": [7,9] }
+
+# 2) 新增说话人（名称自动 trim；首次传 list_revision=0）
+curl -s -X POST http://localhost:8080/api/videos/$V/speakers \
+  -H 'Content-Type: application/json' -d '{"name":"  主持人  ","list_revision":0}'
+# -> 201 { "speaker": {"id":1,"name":"主持人","usage_count":0},
+#          "list_revision":1, "speakers":[...] }
+
+# 3) 再新增一位（携带当前名单修订号 1）
+curl -s -X POST http://localhost:8080/api/videos/$V/speakers \
+  -H 'Content-Type: application/json' -d '{"name":"嘉宾A","list_revision":1}'
+
+# 4) 把片段 #7 归属给说话人 #1（携带所见片段修订号）
+curl -s -X PUT http://localhost:8080/api/videos/$V/segments/7/speaker \
+  -H 'Content-Type: application/json' -d '{"speaker_id":1,"revision":3}'
+# -> { "changed": true,
+#      "segment": {"id":7,"speaker_id":1,"speaker_name":"主持人","reviewed":false,"revision":4},
+#      "segments":[...], "unassigned_segment_ids":[9] }
+# 原文文字/时间不变；若该段有译文，译文 stale 仍为 false（不因归属失效）
+
+# 5) 置回未归属（speaker_id 传 null）
+curl -s -X PUT http://localhost:8080/api/videos/$V/segments/7/speaker \
+  -H 'Content-Type: application/json' -d '{"speaker_id":null,"revision":4}'
+
+# 6) 改名（仅影响草稿与今后的发布；历史发布快照不变）
+curl -s -X PUT http://localhost:8080/api/videos/$V/speakers/1 \
+  -H 'Content-Type: application/json' -d '{"name":"主持人（甲）","list_revision":2}'
+
+# 7) 删除说话人（仍被片段引用时拒绝）
+curl -s -X DELETE http://localhost:8080/api/videos/$V/speakers/2 \
+  -H 'Content-Type: application/json' -d '{"list_revision":3}'
 ```
+
+视频存在说话人时，未归属片段会阻止发布；失败响应 `error.pending[]` 逐段给出原因 `speaker_unassigned`：
+
+```json
+{
+  "error": {
+    "code": "not_publishable",
+    "message": "当前草稿不能发布：说话人：1 个片段尚未归属说话人",
+    "pending": [ { "segment_id": 9, "start_ms": 2000, "end_ms": 3000,
+                  "reasons": ["segment_unreviewed", "speaker_unassigned"] } ],
+    "speakers": { "enabled": true, "total": 2, "unassigned": 1, "assigned": 1 }
+  }
+}
+```
+
+发布成功后，版本固定当时的名单名称与逐段归属（说话人快照）；之后改名或改草稿归属都不影响历史版本：
+
+```bash
+# 发布（所有片段已归属且已审、其余门禁通过）
+curl -s -X POST http://localhost:8080/api/videos/$V/publish
+# -> { "publication": { "version": 2, "has_speakers": true, ... } }
+
+# 查询 v2 固定的说话人名单与逐段归属
+curl -s http://localhost:8080/api/videos/$V/publications/2/speakers
+# -> { "snapshot": true, "list_revision": 3,
+#      "speakers": [ {"id":1,"name":"主持人"}, {"id":2,"name":"嘉宾A"} ],
+#      "assignments": [ {"segment_id":7,"speaker_id":1}, {"segment_id":9,"speaker_id":2} ] }
+```
+
+补充不变量：**拆分**片段时左右两段沿用原归属；**SRT 导入**与**历史区间恢复**产生的新片段一律未归属（需重新归属并审校）。
+原文/译文 SRT 导出始终不含说话人信息、语义不变；无说话人名单时发布的旧版本无说话人快照（查询返回 `422 speakers_unavailable`）。
+
+失败约定：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 invalid_speaker_name` | 名称不是字符串、trim 后为空、含换行或超过 100 字符 |
+| `422 duplicate_speaker` | 同视频已存在同名说话人（按 trim 后精确比较） |
+| `422 missing_revision` | 名单写操作缺少 `list_revision`；归属缺少片段 `revision` |
+| `409 revision_conflict` | 名单修订号或片段修订号过期；`error` 带回当前 `speakers/list_revision`（归属时还有 `current.segment`） |
+| `404 speaker_not_found` | 改名/删除的说话人不存在（归属到其他视频的说话人同样按不存在处理） |
+| `422 speaker_in_use` | 说话人仍被草稿片段引用，禁止删除；`error.usage_count` 与 `error.referenced_by[]` 给出引用片段 |
+| `422 missing_speaker` / `invalid_speaker` | 归属请求缺少 `speaker_id`，或其值既不是正整数也不是 `null` |
+| `422 speaker_unassigned`（在 `pending[].reasons` 中） | 有说话人时该片段尚未归属，阻止发布 |
+| `422 speakers_unavailable` | 指定发布版本不含说话人快照（发布时无说话人名单），旧版本行为不变 |
+
+## 数据布局```
 data/
-├── app.db            # SQLite：videos / segments / translations / qc_rules / qc_waivers / publications
+├── app.db            # SQLite：videos / segments / speakers / translations / qc_rules / qc_waivers / publications
 └── videos/           # 上传的原始视频文件（随机化文件名）
 ```
 

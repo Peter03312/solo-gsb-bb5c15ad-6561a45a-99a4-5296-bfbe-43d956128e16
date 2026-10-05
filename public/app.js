@@ -11,6 +11,9 @@ const state = {
   translations: [],      // 当前草稿全部译文（逐段关联）
   qcRules: null,         // 质检阈值（含 revision）
   qcReport: null,        // 当前草稿完整质检报告
+  speakers: [],          // 说话人名单（含 usage_count）
+  listRevision: 0,       // 所见名单修订号
+  unassignedIds: [],     // 未归属片段 ID 清单
   activeSegmentId: null,
   editor: null, // { mode:'create'|'edit', segmentId, revision, initialText, dirty }
   shiftSelected: new Set(), // 整体平移勾选的片段 ID
@@ -208,6 +211,9 @@ async function openVideo(id) {
   state.translations = data.translations || [];
   state.qcRules = data.qc_rules || null;
   state.qcReport = null;
+  state.speakers = data.speakers || [];
+  state.listRevision = data.list_revision || 0;
+  state.unassignedIds = data.unassigned_segment_ids || [];
   state.activeSegmentId = null;
   state.shiftSelected = new Set();
   render();
@@ -244,10 +250,16 @@ async function pollRefresh() {
     const changed =
       JSON.stringify(data.segments.map(stripSeg)) !== JSON.stringify(state.segments.map(stripSeg)) ||
       JSON.stringify((data.translations || []).map(stripTr)) !== JSON.stringify(state.translations.map(stripTr)) ||
-      (data.translation_lang != null ? data.translation_lang : null) !== state.translationLang;
+      (data.translation_lang != null ? data.translation_lang : null) !== state.translationLang ||
+      JSON.stringify((data.speakers || []).map((sp) => [sp.id, sp.name, sp.usage_count]))
+        !== JSON.stringify(state.speakers.map((sp) => [sp.id, sp.name, sp.usage_count])) ||
+      (data.list_revision || 0) !== state.listRevision;
     state.segments = data.segments;
     state.translations = data.translations || [];
     state.translationLang = data.translation_lang != null ? data.translation_lang : null;
+    state.speakers = data.speakers || [];
+    state.listRevision = data.list_revision || 0;
+    state.unassignedIds = data.unassigned_segment_ids || [];
     state.publications = data.publications;
     state.qcRules = data.qc_rules || null;
     syncShiftSelected();
@@ -264,7 +276,7 @@ async function pollRefresh() {
   } catch (_) { /* 忽略轮询错误 */ }
 }
 function stripSeg(s) {
-  return [s.id, s.start_ms, s.end_ms, s.text, s.reviewed, s.revision];
+  return [s.id, s.start_ms, s.end_ms, s.text, s.reviewed, s.revision, s.speaker_id];
 }
 function stripTr(t) {
   return [t.segment_id, t.text, t.reviewed, t.revision, t.stale];
@@ -324,6 +336,7 @@ function renderDetail() {
       </div>
 
       <div>
+        <section class="card" id="speakersCard"></section>
         <section class="card" id="qcCard"></section>
         <section class="card" id="publishCard"></section>
       </div>
@@ -339,6 +352,7 @@ function renderDetail() {
 
   renderTimeline();
   renderSegmentTable();
+  renderSpeakerCard();
   renderPublishCard();
   renderQcPanel();
 }
@@ -348,6 +362,7 @@ function renderSegmentDependent() {
   if (state.view !== 'detail') return;
   renderTimeline();
   renderSegmentTable();
+  renderSpeakerCard();
   renderPublishCard();
   renderQcPanel();
   onTimeUpdate();
@@ -426,7 +441,8 @@ function renderSegmentTable() {
   const tbody = $('segTbody');
   if (!tbody) return;
   const track = !!state.translationLang;
-  const colCount = (track ? 6 : 5) + 1;
+  const hasSpeakers = state.speakers.length > 0;
+  const colCount = (track ? 6 : 5) + (hasSpeakers ? 1 : 0) + 1;
   if (!state.segments.length) {
     tbody.innerHTML = `<tr><td colspan="${colCount}" class="meta">还没有片段，点击右上角「新增片段」。</td></tr>`;
     return;
@@ -436,7 +452,8 @@ function renderSegmentTable() {
   tbody.parentElement.querySelector('thead tr').innerHTML =
     `<th class="shift-col"><input type="checkbox" id="shiftSelectAll" ${allChecked ? 'checked' : ''} ` +
     `${someChecked ? 'data-indeterminate="1"' : ''} title="全选/取消全选（用于整体平移）" /></th>` +
-    `<th>#</th><th>时间</th><th>文本</th>${track ? '<th>译文</th>' : ''}<th>状态</th><th>操作</th>`;
+    `<th>#</th><th>时间</th><th>文本</th>${track ? '<th>译文</th>' : ''}` +
+    `${hasSpeakers ? '<th>说话人</th>' : ''}<th>状态</th><th>操作</th>`;
   const selectAll = $('shiftSelectAll');
   if (selectAll && someChecked) selectAll.indeterminate = true;
   if (selectAll) {
@@ -455,6 +472,14 @@ function renderSegmentTable() {
     const trActions = track ? `
         <button class="btn small" data-act="tr-edit">${tr ? '改译文' : '录译文'}</button>
         ${tr && !tr.stale ? `<button class="btn small ${tr.reviewed ? 'ghost' : 'ok'}" data-act="tr-review">${tr.reviewed ? '取消审译' : '审译'}</button>` : ''}` : '';
+    const speakerCell = hasSpeakers ? `
+      <td>
+        <select class="speaker-select" data-act="speaker" data-rev="${s.revision}">
+          <option value="" ${s.speaker_id == null ? 'selected' : ''}>未归属</option>
+          ${state.speakers.map((sp) => `<option value="${sp.id}" ${s.speaker_id === sp.id ? 'selected' : ''}>${esc(sp.name)}</option>`).join('')}
+        </select>
+        ${s.speaker_id == null ? '<div><span class="tag bad">未归属</span></div>' : ''}
+      </td>` : '';
     return `
     <tr data-id="${s.id}" class="${state.activeSegmentId === s.id ? 'active' : ''} ${checked ? 'shift-selected' : ''}">
       <td class="shift-col"><input type="checkbox" class="shift-check" data-act="shift-pick" ${checked ? 'checked' : ''} title="勾选后可整体平移" /></td>
@@ -463,6 +488,7 @@ function renderSegmentTable() {
       <td class="seg-text-cell">${esc(s.text) || '<span class="meta">(空)</span>'}
           <div class="mono" style="margin-top:3px">rev ${s.revision}</div></td>
       ${trCell}
+      ${speakerCell}
       <td>${s.reviewed ? '<span class="tag ok">已审</span>' : '<span class="tag warn">待审</span>'}</td>
       <td><div class="row-actions">
         <button class="btn small" data-act="seek">定位</button>
@@ -498,7 +524,166 @@ function renderSegmentTable() {
     if (trEditBtn) trEditBtn.addEventListener('click', () => openTrEditor(seg));
     const trReviewBtn = tr.querySelector('[data-act=tr-review]');
     if (trReviewBtn) trReviewBtn.addEventListener('click', () => toggleTrReview(seg));
+    const spSel = tr.querySelector('[data-act=speaker]');
+    if (spSel) spSel.addEventListener('change', () => assignSpeaker(seg, spSel.value === '' ? null : Number(spSel.value), Number(spSel.dataset.rev)));
   });
+}
+
+/* ================= 说话人名单与片段归属 ================= */
+function renderSpeakerCard() {
+  const card = $('speakersCard');
+  if (!card) return;
+  const unassignedSet = new Set(state.unassignedIds);
+  const rows = state.speakers.map((sp) => `
+    <tr>
+      <td>${sp.id}</td>
+      <td><span class="sp-name" data-id="${sp.id}">${esc(sp.name)}</span></td>
+      <td class="mono">${sp.usage_count} 段</td>
+      <td><div class="row-actions">
+        <button class="btn small" data-spact="rename" data-id="${sp.id}">改名</button>
+        <button class="btn small danger" data-spact="delete" data-id="${sp.id}" ${sp.usage_count ? 'disabled title="仍被片段引用，不能删除"' : ''}>删除</button>
+      </div></td>
+    </tr>`).join('');
+  card.innerHTML = `
+    <h2>说话人名单</h2>
+    <p class="meta">按视频维护说话人，并把每个草稿片段归属到一名说话人。名称去首尾空白后不能为空、不能重复；
+      仍被片段引用的说话人不能删除。所有名单修改都携带所见名单修订号 <b>${state.listRevision}</b>；
+      归属修改携带片段修订号，成功后片段转<b>待审</b>（原文文字与时间、译文均不变）。
+      发布固定当时名称与逐段归属，之后改名或改草稿不影响历史版本。</p>
+    <div class="form-row">
+      <label>新增说话人
+        <input type="text" id="newSpeakerName" placeholder="如：主持人 / 嘉宾A" maxlength="100" />
+      </label>
+      <button class="btn small primary" id="addSpeakerBtn">新增（修订号 ${state.listRevision}）</button>
+    </div>
+    <p id="speakerMsg" class="meta"></p>
+    <div class="side-scroll">
+      <table class="seg-table">
+        <thead><tr><th>#</th><th>名称</th><th>引用</th><th>操作</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" class="meta">还没有说话人。存在说话人时，未归属片段会阻止发布。</td></tr>'}</tbody>
+      </table>
+    </div>
+    ${state.speakers.length ? `<p class="meta">未归属片段：<b class="${unassignedSet.size ? 'bad' : 'good'}">${unassignedSet.size}</b> 个
+      （在片段表「说话人」列下拉修改归属）${unassignedSet.size ? `：${[...unassignedSet].slice(0, 20).map((id) => `#${id}`).join('、')}${unassignedSet.size > 20 ? ' …' : ''}` : ''}</p>` : ''}`;
+
+  $('addSpeakerBtn').addEventListener('click', addSpeaker);
+  $('newSpeakerName').addEventListener('keydown', (e) => { if (e.key === 'Enter') addSpeaker(); });
+  card.querySelectorAll('[data-spact=rename]').forEach((btn) =>
+    btn.addEventListener('click', () => renameSpeaker(Number(btn.dataset.id))));
+  card.querySelectorAll('[data-spact=delete]').forEach((btn) =>
+    btn.addEventListener('click', () => deleteSpeaker(Number(btn.dataset.id))));
+}
+
+function speakerMsg(text, bad) {
+  const el = $('speakerMsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = bad ? 'error' : 'meta';
+}
+
+// 名单 409：把服务端返回的当前名单回灌状态并重绘（绝不覆盖他人修改）
+function absorbRosterConflict(data) {
+  state.speakers = data.speakers || [];
+  state.listRevision = data.list_revision || 0;
+  state.unassignedIds = data.unassigned_segment_ids || state.unassignedIds;
+  renderSegmentDependent();
+}
+
+async function addSpeaker() {
+  const input = $('newSpeakerName');
+  const name = input.value.trim();
+  speakerMsg('', false);
+  if (!name) { speakerMsg('名称去首尾空白后不能为空', true); return; }
+  try {
+    const data = await api(`/api/videos/${state.video.id}/speakers`, {
+      method: 'POST', body: { name, list_revision: state.listRevision },
+    });
+    state.speakers = data.speakers;
+    state.listRevision = data.list_revision;
+    input.value = '';
+    renderSegmentDependent();
+    toast(`已新增说话人「${data.speaker.name}」`);
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.speakers) {
+      absorbRosterConflict(err.data);
+      speakerMsg(`名单已被他人修改，已刷新：${err.message}`, true);
+    } else {
+      speakerMsg(err.message, true);
+    }
+  }
+}
+
+async function renameSpeaker(id) {
+  const sp = state.speakers.find((x) => x.id === id);
+  if (!sp) return;
+  const name = prompt(`修改说话人 #${id} 的名称（改名只影响草稿与今后的发布；历史发布版本固定的名称不变）：`, sp.name);
+  if (name == null) return;
+  const trimmed = name.trim();
+  if (!trimmed) { toast('名称去首尾空白后不能为空', true); return; }
+  try {
+    const data = await api(`/api/videos/${state.video.id}/speakers/${id}`, {
+      method: 'PUT', body: { name: trimmed, list_revision: state.listRevision },
+    });
+    state.speakers = data.speakers;
+    state.listRevision = data.list_revision;
+    renderSegmentDependent();
+    toast(`说话人已改名为「${trimmed}」`);
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.speakers) {
+      absorbRosterConflict(err.data);
+      toast(`名单已被他人修改，已刷新：${err.message}`, true);
+    } else {
+      toast(`改名失败：${err.message}`, true);
+    }
+  }
+}
+
+async function deleteSpeaker(id) {
+  const sp = state.speakers.find((x) => x.id === id);
+  if (!sp) return;
+  if (sp.usage_count > 0) { toast(`「${sp.name}」仍被 ${sp.usage_count} 个片段引用，请先改这些片段的归属`, true); return; }
+  if (!confirm(`确定删除说话人「${sp.name}」？\n该操作携带名单修订号 ${state.listRevision}。`)) return;
+  try {
+    const data = await api(`/api/videos/${state.video.id}/speakers/${id}`, {
+      method: 'DELETE', body: { list_revision: state.listRevision },
+    });
+    state.speakers = data.speakers;
+    state.listRevision = data.list_revision;
+    renderSegmentDependent();
+    toast(`已删除说话人「${sp.name}」`);
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.speakers) {
+      absorbRosterConflict(err.data);
+      toast(`名单已被他人修改，已刷新：${err.message}`, true);
+    } else {
+      toast(`删除失败：${err.message}`, true);
+    }
+  }
+}
+
+// 修改片段归属：携带所见片段修订号；成功后片段修订号 +1、转待审；文字/时间/译文不变
+async function assignSpeaker(seg, speakerId, seenRevision) {
+  const label = speakerId == null ? '未归属' : (state.speakers.find((x) => x.id === speakerId) || {}).name || `#${speakerId}`;
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/${seg.id}/speaker`, {
+      method: 'PUT', body: { speaker_id: speakerId, revision: seenRevision },
+    });
+    state.segments = data.segments;
+    state.unassignedIds = data.unassigned_segment_ids || [];
+    renderSegmentDependent();
+    toast(data.changed
+      ? `片段 #${seg.id} 已归属「${label}」（原文转待审；文字、时间与译文不变）`
+      : `片段 #${seg.id} 本就归属「${label}」，无变化`);
+  } catch (err) {
+    if (err.status === 409) {
+      await refreshCurrent();
+      if (err.data && err.data.speakers) absorbRosterConflict(err.data);
+      toast(`冲突：${err.message}，已刷新当前状态`, true);
+    } else {
+      toast(`归属修改失败：${err.message}`, true);
+      await refreshCurrent();
+    }
+  }
 }
 
 /* ================= 片段编辑弹窗 ================= */
@@ -620,6 +805,9 @@ async function refreshCurrent() {
   state.translations = data.translations || [];
   state.translationLang = data.translation_lang != null ? data.translation_lang : null;
   state.qcRules = data.qc_rules || null;
+  state.speakers = data.speakers || [];
+  state.listRevision = data.list_revision || 0;
+  state.unassignedIds = data.unassigned_segment_ids || [];
   syncShiftSelected();
   renderSegmentDependent();
   try { await loadQcReport(); renderQcPanel(); } catch (_) { /* 忽略 */ }
@@ -1149,6 +1337,14 @@ function computeStatus() {
   }
   if (state.segments.some((s) => !s.reviewed)) problems.push('仍有片段未通过审校');
 
+  // 说话人门禁：存在名单时，每段都必须归属
+  let sp = null;
+  if (state.speakers.length) {
+    sp = { total: state.speakers.length, unassigned: 0 };
+    for (const s of state.segments) if (s.speaker_id == null) sp.unassigned++;
+    if (sp.unassigned) problems.push(`说话人：${sp.unassigned} 个片段尚未归属说话人`);
+  }
+
   // 译文轨道门禁：每段译文齐备、已审且对应当前原文（未失效）
   let tr = null;
   if (state.translationLang) {
@@ -1174,6 +1370,7 @@ function computeStatus() {
     problems,
     reviewedCount: state.segments.filter((s) => s.reviewed).length,
     tr,
+    sp,
     qc,
   };
 }
@@ -1190,6 +1387,9 @@ function renderPublishCard() {
       <li class="${state.segments.length ? 'good' : 'bad'}">片段数量：${state.segments.length}（至少 1 段）</li>
       <li class="${status.reviewedCount === state.segments.length && state.segments.length ? 'good' : 'bad'}">
         审校进度：${status.reviewedCount}/${state.segments.length}</li>
+      ${status.sp ? `<li class="${status.sp.unassigned === 0 && state.segments.length ? 'good' : 'bad'}">
+        说话人归属：${state.segments.length - status.sp.unassigned}/${state.segments.length}
+        （名单 ${status.sp.total} 人）${status.sp.unassigned ? `｜<b>${status.sp.unassigned} 段未归属，阻止发布</b>` : ''}</li>` : ''}
       ${track ? `<li class="${status.tr.missing + status.tr.stale + status.tr.unreviewed === 0 && state.segments.length ? 'good' : 'bad'}">
         译文（${esc(state.translationLang)}）已审：${status.tr.ok}/${state.segments.length}
         ${status.tr.missing ? `｜未译 ${status.tr.missing}` : ''}${status.tr.stale ? `｜已失效 ${status.tr.stale}` : ''}${status.tr.unreviewed ? `｜待审 ${status.tr.unreviewed}` : ''}</li>` : ''}
@@ -1257,7 +1457,7 @@ function renderPublishCard() {
   const pubList = $('pubList');
   pubList.innerHTML = state.publications.length
     ? '历史发布：' + state.publications
-        .map((p) => `v${p.version}${p.has_translation ? '（双轨）' : ''}${p.has_qc ? '（含质检快照）' : ''} · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段
+        .map((p) => `v${p.version}${p.has_translation ? '（双轨）' : ''}${p.has_qc ? '（含质检快照）' : ''}${p.has_speakers ? '（含说话人快照）' : ''} · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段
           <a href="javascript:void(0)" class="qc-pub-link" data-version="${p.version}">${p.has_qc ? '查看质检快照' : '质检快照（无）'}</a>`)
         .join(' ｜ ')
     : '尚未发布过版本';
